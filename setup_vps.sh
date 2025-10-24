@@ -51,6 +51,15 @@ echo "alias ls='eza -lh --group-directories-first --icons --time-style=long-iso'
 echo "Configuring ble.sh..."
 echo "source ~/.local/share/blesh/ble.sh" >> ~/.bashrc
 
+# Install zoxide
+echo "Installing zoxide..."
+curl -sSfL https://raw.githubusercontent.com/ajeetdsouza/zoxide/main/install.sh | sh
+
+# Configure zoxide for Bash
+echo "Configuring zoxide..."
+echo 'eval "$(zoxide init bash)"' >> ~/.bashrc
+echo 'alias cd="z"' >> ~/.bashrc
+
 # --- Step 3: Install UV (Python Package Manager) ---
 echo "Installing uv..."
 if ! command -v uv &> /dev/null
