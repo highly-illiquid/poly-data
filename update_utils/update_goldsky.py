@@ -30,15 +30,18 @@ def get_latest_timestamp():
         return 0
     
     try:
-        # Use Polars to read the last timestamp from the Parquet file
-        df = pl.read_parquet(cache_file)
-        if len(df) > 0 and 'timestamp' in df.columns:
-            last_timestamp = df.select(pl.col('timestamp')).tail(1).item()
+        # Use Polars lazy API to read only the last timestamp from the Parquet file
+        # Collect only the last item to minimize memory usage
+        last_timestamp = pl.scan_parquet(cache_file).select(pl.col('timestamp')).tail(1).collect().item()
+        if last_timestamp is not None:
             readable_time = datetime.fromtimestamp(int(last_timestamp), tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
             print(f'Resuming from timestamp {last_timestamp} ({readable_time})')
             return int(last_timestamp)
+        else:
+            print(f"Parquet file {cache_file} is empty or timestamp column missing. Starting from beginning.")
+            return 0
     except Exception as e:
-        print(f"Error reading latest file with Polars: {e}")
+        print(f"Error reading latest timestamp from Parquet with Polars lazy API: {e}")
     
     # Fallback to beginning of time
     print("Falling back to beginning of time (timestamp 0)")
