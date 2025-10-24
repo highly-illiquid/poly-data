@@ -14,13 +14,12 @@ if not os.path.exists(csv_path):
     exit(1)
 
 # Load the CSV
-print(f"Loading {csv_path} (this may take a while for large files)...")
-df = pl.read_csv(csv_path, schema_overrides={'makerAssetId': pl.Utf8, 'takerAssetId': pl.Utf8})
-print(f"CSV loaded. Shape: {df.shape}")
+print(f"Loading {csv_path} lazily (this is memory-efficient)...")
+lf = pl.scan_csv(csv_path, schema_overrides={'makerAssetId': pl.Utf8, 'takerAssetId': pl.Utf8})
 
-# Write to Parquet
-print(f"Writing to {parquet_path}...")
-df.write_parquet(parquet_path)
+# Write to Parquet in a streaming fashion
+print(f"Writing to {parquet_path} in a streaming fashion...")
+lf.sink_parquet(parquet_path)
 print(f"Parquet file created.")
 
 # Verify new file size and delete old files
