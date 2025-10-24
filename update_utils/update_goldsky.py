@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import subprocess
 import time
 from update_utils.update_markets import update_markets
+import polars as pl # Added polars import
 
 # Global runtime timestamp - set once when program starts
 RUNTIME_TIMESTAMP = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -18,42 +19,26 @@ if not os.path.isdir('goldsky'):
     os.mkdir('goldsky')
 
 def get_latest_timestamp():
-    """Get the latest timestamp from orderFilled.csv, or 0 if file doesn't exist"""
-    cache_file = 'goldsky/orderFilled.csv'
+    """Get the latest timestamp from orderFilled.parquet, or 0 if file doesn't exist"""
+    cache_file = 'goldsky/orderFilled.parquet'
+    print(f"DEBUG: Checking for cache file at absolute path: {os.path.abspath(cache_file)}")
+    file_exists_check = os.path.isfile(cache_file)
+    print(f"DEBUG: os.path.isfile(cache_file) returned: {file_exists_check}")
     
-    if not os.path.isfile(cache_file):
+    if not file_exists_check:
         print("No existing file found, starting from beginning of time (timestamp 0)")
         return 0
     
     try:
-        # Use tail to get the last line efficiently
-        result = subprocess.run(['tail', '-n', '1', cache_file], capture_output=True, text=True, check=True)
-        last_line = result.stdout.strip()
-        if last_line:
-            # Get header to find timestamp column index
-            header_result = subprocess.run(['head', '-n', '1', cache_file], capture_output=True, text=True, check=True)
-            headers = header_result.stdout.strip().split(',')
-            
-            if 'timestamp' in headers:
-                timestamp_index = headers.index('timestamp')
-                values = last_line.split(',')
-                if len(values) > timestamp_index:
-                    last_timestamp = int(values[timestamp_index])
-                    readable_time = datetime.fromtimestamp(last_timestamp, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-                    print(f'Resuming from timestamp {last_timestamp} ({readable_time})')
-                    return last_timestamp
+        # Use Polars to read the last timestamp from the Parquet file
+        df = pl.read_parquet(cache_file)
+        if len(df) > 0 and 'timestamp' in df.columns:
+            last_timestamp = df.select(pl.col('timestamp')).tail(1).item()
+            readable_time = datetime.fromtimestamp(int(last_timestamp), tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+            print(f'Resuming from timestamp {last_timestamp} ({readable_time})')
+            return int(last_timestamp)
     except Exception as e:
-        print(f"Error reading latest file with tail: {e}")
-        # Fallback to pandas
-        try:
-            df = pd.read_csv(cache_file)
-            if len(df) > 0 and 'timestamp' in df.columns:
-                last_timestamp = df.iloc[-1]['timestamp']
-                readable_time = datetime.fromtimestamp(int(last_timestamp), tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-                print(f'Resuming from timestamp {last_timestamp} ({readable_time})')
-                return int(last_timestamp)
-        except Exception as e2:
-            print(f"Error reading with pandas: {e2}")
+        print(f"Error reading latest file with Polars: {e}")
     
     # Fallback to beginning of time
     print("Falling back to beginning of time (timestamp 0)")
@@ -71,7 +56,7 @@ def scrape(at_once=1000):
 
     print(f"\nStarting scrape for orderFilledEvents")
     
-    output_file = 'goldsky/orderFilled.csv'
+    output_file = 'goldsky/orderFilled.parquet' # Updated to Parquet
     print(f"Output file: {output_file}")
     print(f"Saving columns: {COLUMNS_TO_SAVE}")
 
@@ -111,11 +96,11 @@ def scrape(at_once=1000):
             print(f"No more data for orderFilledEvents")
             break
 
-        df = pd.DataFrame([flatten(x) for x in res['orderFilledEvents']]).reset_index(drop=True)
+        df = pl.DataFrame([flatten(x) for x in res['orderFilledEvents']])
         
         # Sort by timestamp and update last_value
-        df = df.sort_values('timestamp', ascending=True).reset_index(drop=True)
-        last_value = df.iloc[-1]['timestamp']
+        df = df.sort('timestamp')
+        last_value = df.select(pl.col('timestamp')).tail(1).item()
         
         readable_time = datetime.fromtimestamp(int(last_value), tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         print(f"Batch {count + 1}: Last timestamp {last_value} ({readable_time}), Records: {len(df)}")
@@ -124,16 +109,18 @@ def scrape(at_once=1000):
         total_records += len(df)
 
         # Remove duplicates
-        df = df.drop_duplicates()
+        df = df.unique()
 
         # Filter to only the columns we want to save
-        df_to_save = df[COLUMNS_TO_SAVE].copy()
+        df_to_save = df.select(COLUMNS_TO_SAVE)
 
         # Save to file
         if os.path.isfile(output_file):
-            df_to_save.to_csv(output_file, index=None, mode='a', header=None)
+            existing_df = pl.read_parquet(output_file)
+            combined_df = pl.concat([existing_df, df_to_save]).unique()
+            combined_df.write_parquet(output_file)
         else:
-            df_to_save.to_csv(output_file, index=None)
+            df_to_save.write_parquet(output_file)
 
         if len(df) < at_once:
             break
