@@ -15,7 +15,7 @@ if not os.path.exists(csv_path):
 
 # Load the CSV
 print(f"Loading {csv_path} (this may take a while for large files)...")
-df = pl.read_csv(csv_path)
+df = pl.read_csv(csv_path, schema_overrides={'makerAssetId': pl.Utf8, 'takerAssetId': pl.Utf8})
 print(f"CSV loaded. Shape: {df.shape}")
 
 # Write to Parquet
