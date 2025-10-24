@@ -63,6 +63,8 @@ def scrape(at_once=1000):
     print(f"Output file: {output_file}")
     print(f"Saving columns: {COLUMNS_TO_SAVE}")
 
+    new_batches_dfs = [] # List to store new batches
+
     while True:
         q_string = '''query MyQuery {
                         orderFilledEvents(orderBy: timestamp 
@@ -116,14 +118,7 @@ def scrape(at_once=1000):
 
         # Filter to only the columns we want to save
         df_to_save = df.select(COLUMNS_TO_SAVE)
-
-        # Save to file
-        if os.path.isfile(output_file):
-            existing_df = pl.read_parquet(output_file)
-            combined_df = pl.concat([existing_df, df_to_save]).unique()
-            combined_df.write_parquet(output_file)
-        else:
-            df_to_save.write_parquet(output_file)
+        new_batches_dfs.append(df_to_save) # Add to list
 
         if len(df) < at_once:
             break
@@ -131,6 +126,21 @@ def scrape(at_once=1000):
     print(f"Finished scraping orderFilledEvents")
     print(f"Total new records: {total_records}")
     print(f"Output file: {output_file}")
+
+    # Combine all new batches and save to Parquet
+    if new_batches_dfs:
+        all_new_data = pl.concat(new_batches_dfs)
+        
+        if os.path.isfile(output_file):
+            print(f"Appending {len(all_new_data):,} new records to {output_file}")
+            existing_df = pl.read_parquet(output_file)
+            combined_df = pl.concat([existing_df, all_new_data]).unique()
+            combined_df.write_parquet(output_file)
+        else:
+            print(f"Writing {len(all_new_data):,} new records to new file {output_file}")
+            all_new_data.write_parquet(output_file)
+    else:
+        print("No new data scraped to save.")
 
 def update_goldsky():
     """Run scraping for orderFilledEvents"""
