@@ -15,7 +15,7 @@ sudo apt update && sudo apt upgrade -y
 
 # --- Step 2: Install Essential Tools ---
 echo "Installing git, python3, and python3-pip..."
-sudo apt install git python3 python3-pip unzip -y
+sudo apt install git python3 python3-pip unzip gh -y
 
 # Install eza
 echo "Installing eza..."
