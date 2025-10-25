@@ -1,3 +1,9 @@
+# Ignore Mac OS metadata files
+._*
+
+# Ignore parquet files
+*.parquet
+
 markets.csv
 processed/
 goldsky/

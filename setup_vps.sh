@@ -88,5 +88,23 @@ tar -xf "${ARCHIVE_FILE}"
 echo "Installing Python dependencies using uv..."
 uv sync
 
+# --- Step 7: Install nvm, Node.js, and npm ---
+echo "Installing nvm..."
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+
+# Activate NVM
+echo "Activating nvm and installing Node.js LTS..."
+export NVM_DIR="$HOME/.nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
+
+nvm install --lts
+nvm alias default 'lts/*'
+
+# --- Step 8: Install Gemini CLI ---
+echo "Installing Gemini CLI..."
+npm install -g @google/gemini-cli
+
+
 echo "VPS setup complete for ${PROJECT_DIR}!"
 echo "You can now run your data pipeline using: tmux new -s data_pipeline && uv run python update_all.py"
