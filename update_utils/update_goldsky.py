@@ -1,13 +1,12 @@
 import os
-import pandas as pd
 from gql import gql, Client
 from gql.transport.requests import RequestsHTTPTransport
 from flatten_json import flatten
 from datetime import datetime, timezone
-import subprocess
 import time
-from update_utils.update_markets import update_markets
-import polars as pl # Added polars import
+import polars as pl
+import pyarrow.parquet as pq
+import pyarrow.dataset as ds
 
 # Global runtime timestamp - set once when program starts
 RUNTIME_TIMESTAMP = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -19,55 +18,49 @@ if not os.path.isdir('goldsky'):
     os.mkdir('goldsky')
 
 def get_latest_timestamp():
-    """Get the latest timestamp from orderFilled.parquet, or 0 if file doesn't exist"""
-    cache_file = 'goldsky/orderFilled.parquet'
-    print(f"DEBUG: Checking for cache file at absolute path: {os.path.abspath(cache_file)}")
-    file_exists_check = os.path.isfile(cache_file)
-    print(f"DEBUG: os.path.isfile(cache_file) returned: {file_exists_check}")
-    
-    if not file_exists_check:
-        print("No existing file found, starting from beginning of time (timestamp 0)")
+    """Get the latest timestamp from the partitioned parquet dataset, or 0 if it doesn't exist"""
+    cache_dir = 'goldsky/orderFilled'
+    if not os.path.isdir(cache_dir):
+        print("No existing data found, starting from beginning of time (timestamp 0)")
         return 0
-    
+
     try:
-        # Use Polars lazy API to read only the last timestamp from the Parquet file
-        # Collect only the last item to minimize memory usage
-        last_timestamp = pl.scan_parquet(cache_file).select(pl.col('timestamp')).tail(1).collect().item()
-        if last_timestamp is not None:
-            readable_time = datetime.fromtimestamp(int(last_timestamp), tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-            print(f'Resuming from timestamp {last_timestamp} ({readable_time})')
-            return int(last_timestamp)
+        dataset = ds.parquet_dataset(cache_dir)
+        if not dataset.files:
+            return 0
+        latest_timestamp = dataset.to_table(columns=['timestamp']).group_by([]).aggregate([('timestamp', 'max')]).to_pydict()['timestamp_max'][0]
+
+        if latest_timestamp:
+            readable_time = datetime.fromtimestamp(int(latest_timestamp), tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+            print(f'Resuming from timestamp {latest_timestamp} ({readable_time})')
+            return int(latest_timestamp)
         else:
-            print(f"Parquet file {cache_file} is empty or timestamp column missing. Starting from beginning.")
             return 0
     except Exception as e:
-        print(f"Error reading latest timestamp from Parquet with Polars lazy API: {e}")
-    
-    # Fallback to beginning of time
-    print("Falling back to beginning of time (timestamp 0)")
-    return 0
+        print(f"Error reading latest timestamp: {e}")
+        return 0
 
 def scrape(at_once=1000):
     QUERY_URL = "https://api.goldsky.com/api/public/project_cl6mb8i9h0003e201j6li0diw/subgraphs/orderbook-subgraph/0.0.1/gn"
     print(f"Query URL: {QUERY_URL}")
     print(f"Runtime timestamp: {RUNTIME_TIMESTAMP}")
-    
-    # Get starting timestamp from latest file
+
     last_value = get_latest_timestamp()
     count = 0
     total_records = 0
 
     print(f"\nStarting scrape for orderFilledEvents")
-    
-    output_file = 'goldsky/orderFilled.parquet' # Updated to Parquet
-    print(f"Output file: {output_file}")
-    print(f"Saving columns: {COLUMNS_TO_SAVE}")
 
-    new_batches_dfs = [] # List to store new batches
+    output_dir = 'goldsky/orderFilled'
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    print(f"Output directory: {output_dir}")
+    print(f"Saving columns: {COLUMNS_TO_SAVE}")
 
     while True:
         q_string = '''query MyQuery {
-                        orderFilledEvents(orderBy: timestamp 
+                        orderFilledEvents(orderBy: timestamp
                                              first: ''' + str(at_once) + '''
                                              where: {timestamp_gt: "''' + str(last_value) + '''"}) {
                             fee
@@ -88,7 +81,7 @@ def scrape(at_once=1000):
         query = gql(q_string)
         transport = RequestsHTTPTransport(url=QUERY_URL, verify=True, retries=3)
         client = Client(transport=transport)
-        
+
         try:
             res = client.execute(query)
         except Exception as e:
@@ -96,51 +89,49 @@ def scrape(at_once=1000):
             print("Retrying in 5 seconds...")
             time.sleep(5)
             continue
-        
+
         if not res['orderFilledEvents'] or len(res['orderFilledEvents']) == 0:
             print(f"No more data for orderFilledEvents")
             break
 
         df = pl.DataFrame([flatten(x) for x in res['orderFilledEvents']])
-        
-        # Sort by timestamp and update last_value
+
+        if df.height == 0:
+            break
+            
         df = df.sort('timestamp')
         last_value = df.select(pl.col('timestamp')).tail(1).item()
-        
+
         readable_time = datetime.fromtimestamp(int(last_value), tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         print(f"Batch {count + 1}: Last timestamp {last_value} ({readable_time}), Records: {len(df)}")
-        
+
         count += 1
         total_records += len(df)
 
-        # Remove duplicates
         df = df.unique()
 
-        # Filter to only the columns we want to save
         df_to_save = df.select(COLUMNS_TO_SAVE)
-        new_batches_dfs.append(df_to_save) # Add to list
+        
+        df_to_save = df_to_save.with_columns([
+            pl.from_epoch(pl.col('timestamp'), time_unit='s').dt.year().alias('year'),
+            pl.from_epoch(pl.col('timestamp'), time_unit='s').dt.month().alias('month'),
+            pl.from_epoch(pl.col('timestamp'), time_unit='s').dt.day().alias('day'),
+        ])
+        
+        table = df_to_save.to_arrow()
+
+        pq.write_to_dataset(
+            table,
+            root_path=output_dir,
+            partition_cols=['year', 'month', 'day'],
+            existing_data_behavior='overwrite_or_ignore'
+        )
 
         if len(df) < at_once:
             break
 
     print(f"Finished scraping orderFilledEvents")
     print(f"Total new records: {total_records}")
-    print(f"Output file: {output_file}")
-
-    # Combine all new batches and save to Parquet
-    if new_batches_dfs:
-        all_new_data = pl.concat(new_batches_dfs)
-        
-        if os.path.isfile(output_file):
-            print(f"Appending {len(all_new_data):,} new records to {output_file}")
-            existing_df = pl.read_parquet(output_file)
-            combined_df = pl.concat([existing_df, all_new_data]).unique()
-            combined_df.write_parquet(output_file)
-        else:
-            print(f"Writing {len(all_new_data):,} new records to new file {output_file}")
-            all_new_data.write_parquet(output_file)
-    else:
-        print("No new data scraped to save.")
 
 def update_goldsky():
     """Run scraping for orderFilledEvents"""

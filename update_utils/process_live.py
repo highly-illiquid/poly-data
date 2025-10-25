@@ -10,7 +10,6 @@ from poly_utils.utils import get_markets, update_missing_tokens
 
 import subprocess
 
-import pandas as pd
 
 def get_processed_df(df):
     markets_df = get_markets()
@@ -69,8 +68,8 @@ def get_processed_df(df):
 
         # reverse of taker_direction
         pl.when(pl.col("takerAsset") == "USDC")
-        .then(pl.lit("SELL"))
-        .otherwise(pl.lit("BUY"))
+        .then(pl.lit("SELL")),
+        .otherwise(pl.lit("BUY")),
         .alias("maker_direction"),
     ])
 
@@ -86,11 +85,11 @@ def get_processed_df(df):
         .alias("usd_amount"),
         pl.when(pl.col("takerAsset") != "USDC")
         .then(pl.col("takerAmountFilled"))
-        .otherwise(pl.col("makerAmountFilled"))
+        .otherwise(pl.col("makerAmountFilled")),
         .alias("token_amount"),
         pl.when(pl.col("takerAsset") == "USDC")
-        .then(pl.col("takerAmountFilled") / pl.col("makerAmountFilled"))
-        .otherwise(pl.col("makerAmountFilled") / pl.col("takerAmountFilled"))
+        .then(pl.col("takerAmountFilled") / pl.col("makerAmountFilled")),
+        .otherwise(pl.col("makerAmountFilled") / pl.col("takerAmountFilled")),
         .cast(pl.Float64)
         .alias("price")
     ])
@@ -100,7 +99,6 @@ def get_processed_df(df):
     return df
 
 
-
 def process_live():
     processed_file = 'processed/trades.csv'
 
@@ -108,70 +106,60 @@ def process_live():
     print("🔄 Processing Live Trades")
     print("=" * 60)
 
-    last_processed = {}
+    last_processed_timestamp = 0
 
     if os.path.exists(processed_file):
         print(f"✓ Found existing processed file: {processed_file}")
-        result = subprocess.run(['tail', '-n', '1', processed_file], capture_output=True, text=True)
-        last_line = result.stdout.strip()
-        splitted = last_line.split(',')
+        try:
+            last_processed_timestamp = pl.read_csv(processed_file).select(pl.max('timestamp')).item()
+            if last_processed_timestamp:
+                print(f"📍 Resuming from: {last_processed_timestamp}")
+        except Exception as e:
+            print(f"Could not read last processed timestamp: {e}")
 
-        last_processed['timestamp'] = pd.to_datetime(splitted[0])
-        last_processed['transactionHash'] = splitted[-1]
-        last_processed['maker'] = splitted[2]
-        last_processed['taker'] = splitted[3]
-        
-        print(f"📍 Resuming from: {last_processed['timestamp']}")
-        print(f"   Last hash: {last_processed['transactionHash'][:16]}...")
     else:
         print("⚠ No existing processed file found - processing from beginning")
 
-    print(f"\n📂 Reading: goldsky/orderFilled.csv")
+    print(f"\n📂 Reading: goldsky/orderFilled")
 
     schema_overrides = {
         "takerAssetId": pl.Utf8,
         "makerAssetId": pl.Utf8,
     }
 
-    df = pl.scan_csv("goldsky/orderFilled.csv", schema_overrides=schema_overrides).collect(streaming=True)
+    df = pl.scan_parquet("goldsky/orderFilled/**/*.parquet", schema_overrides=schema_overrides).collect(streaming=True)
     df = df.with_columns(
         pl.from_epoch(pl.col('timestamp'), time_unit='s').alias('timestamp')
     )
 
     print(f"✓ Loaded {len(df):,} rows")
 
-    df = df.with_row_index()
-
-    same_timestamp = df.filter(pl.col('timestamp') == last_processed['timestamp'])
-    same_timestamp = same_timestamp.filter(
-        (pl.col("transactionHash") == last_processed['transactionHash']) & (pl.col("maker") == last_processed['maker']) & (pl.col("taker") == last_processed['taker'])
-    )
-
-    df_process = df.filter(pl.col('index') > same_timestamp.row(0)[0])
-    df_process = df_process.drop('index')
+    if last_processed_timestamp:
+        df_process = df.filter(pl.col('timestamp') > last_processed_timestamp)
+    else:
+        df_process = df
 
     print(f"⚙️  Processing {len(df_process):,} new rows...")
 
-    new_df = get_processed_df(df_process)
-    
-    if not os.path.isdir('processed'):
-        os.makedirs('processed')
+    if len(df_process) > 0:
+        new_df = get_processed_df(df_process)
 
+        if not os.path.isdir('processed'):
+            os.makedirs('processed')
 
-    op_file = 'processed/trades.csv'
+        op_file = 'processed/trades.csv'
 
-    if not os.path.isfile(op_file):
-        new_df.write_csv(op_file)
-        print(f"✓ Created new file: processed/trades.csv")
-    else:
-        print(f"✓ Appending {len(new_df):,} rows to processed/trades.csv")
-        with open(op_file, mode="a") as f:
-            new_df.write_csv(f, include_header=False)
+        if not os.path.isfile(op_file):
+            new_df.write_csv(op_file)
+            print(f"✓ Created new file: processed/trades.csv")
+        else:
+            print(f"✓ Appending {len(new_df):,} rows to processed/trades.csv")
+            with open(op_file, mode="a") as f:
+                new_df.write_csv(f, include_header=False)
 
-    
     print("=" * 60)
     print("✅ Processing complete!")
     print("=" * 60)
-    
+
 if __name__ == "__main__":
     process_live()
