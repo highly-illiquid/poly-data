@@ -7,7 +7,14 @@
 - `pip`: Used for initial installation of `uv` if not installed via `curl` script.
 
 **Version Control & Deployment:**
-- `git`: For managing source code, pushing local changes to a remote repository (e.g., GitHub), and cloning/pulling updates on the VPS.
+- `git`: For managing source code, pushing local changes to a remote repository (e.g., GitHub), and cloning/pulling updates on the VPS. Feature branches are used for new development.
+
+**Data Storage: Partitioned Parquet Datalake**
+- The entire data pipeline is built around partitioned Parquet datasets, creating a simple but powerful file-based datalake.
+- **Raw Zone:** `markets_partitioned/` and `goldsky/orderFilled/` store raw data partitioned by date.
+- **Processed Zone:** `processed/trades/` stores the final, enriched output, also as a partitioned dataset.
+- This approach was chosen for high performance and memory efficiency on a resource-constrained VPS.
+- The pipeline scripts are designed to be resilient to schema inconsistencies from the source APIs (e.g., missing columns, incorrect data types), which proved to be a major challenge.
 
 **Data Transfer:**
 - `rsync`: For efficient synchronization of processed data files from the VPS to the local machine.
@@ -25,6 +32,7 @@
 **Key Python Libraries (from `pyproject.toml`):
 - `pandas`
 - `polars`
+- `pyarrow`
 - `requests`
 - `gql[requests]`
 - `flatten-json`

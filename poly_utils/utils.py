@@ -1,5 +1,4 @@
 import os
-import csv
 import json
 import requests
 import time
@@ -9,30 +8,28 @@ import polars as pl
 PLATFORM_WALLETS = ['0xc5d563a36ae78145c45a50134d48a1215220f80a', '0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e']
 
 
-def get_markets(main_file: str = "markets.csv", missing_file: str = "missing_markets.csv"):
+def get_markets(main_dir: str = "markets_partitioned", missing_file: str = "missing_markets.parquet"):
     """
-    Load and combine markets from both files, deduplicate, and sort by createdAt
-    Returns combined Polars DataFrame sorted by creation date
+    Load and combine markets from the partitioned parquet dataset and the missing markets parquet file.
+    Deduplicates and sorts by createdAt.
+    Returns combined Polars DataFrame sorted by creation date.
     """
     import polars as pl
     
-    # Schema overrides for long token IDs
-    schema_overrides = {
-        "token1": pl.Utf8,      # 76-digit ids → strings
-        "token2": pl.Utf8,
-    }
-    
     dfs = []
     
-    # Load main markets file
-    if os.path.exists(main_file):
-        main_df = pl.scan_csv(main_file, schema_overrides=schema_overrides).collect(streaming=True)
-        dfs.append(main_df)
-        print(f"Loaded {len(main_df)} markets from {main_file}")
+    # Load main markets from partitioned parquet dataset
+    if os.path.exists(main_dir) and any(os.scandir(main_dir)):
+        files = sorted([os.path.join(root, f) for root, _, files in os.walk(main_dir) for f in files if f.endswith('.parquet')])
+        if files:
+            scans = [pl.scan_parquet(f) for f in files]
+            main_df = pl.concat(scans, how='diagonal').collect(streaming=True)
+            dfs.append(main_df)
+            print(f"Loaded {len(main_df)} markets from {main_dir}")
     
     # Load missing markets file
     if os.path.exists(missing_file):
-        missing_df = pl.scan_csv(missing_file, schema_overrides=schema_overrides).collect(streaming=True)
+        missing_df = pl.read_parquet(missing_file)
         dfs.append(missing_df)
         print(f"Loaded {len(missing_df)} markets from {missing_file}")
     
@@ -51,13 +48,13 @@ def get_markets(main_file: str = "markets.csv", missing_file: str = "missing_mar
     return combined_df
 
 
-def update_missing_tokens(missing_token_ids: List[str], csv_filename: str = "missing_markets.csv"):
+def update_missing_tokens(missing_token_ids: List[str], parquet_filename: str = "missing_markets.parquet"):
     """
-    Fetch market data for missing token IDs and save to separate CSV file
+    Fetch market data for missing token IDs and save to a parquet file.
     
     Args:
         missing_token_ids: List of token IDs to fetch
-        csv_filename: CSV file to save missing markets (default: missing_markets.csv)
+        parquet_filename: Parquet file to save missing markets (default: missing_markets.parquet)
     """
     if not missing_token_ids:
         print("No missing tokens to fetch")
@@ -65,30 +62,18 @@ def update_missing_tokens(missing_token_ids: List[str], csv_filename: str = "mis
     
     print(f"Fetching {len(missing_token_ids)} missing tokens...")
     
-    # Same headers as main markets.csv
-    headers = [
-        'createdAt', 'id', 'question', 'answer1', 'answer2', 'neg_risk', 
-        'market_slug', 'token1', 'token2', 'condition_id', 'volume', 'ticker', 'closedTime'
-    ]
-    
-    # Check if file exists to determine if we need headers
-    file_exists = os.path.exists(csv_filename)
-    
-    new_markets = []
+    new_markets_data = []
     processed_market_ids = set()
     
     # If file exists, read existing market IDs to avoid duplicates
-    if file_exists:
+    if os.path.exists(parquet_filename):
         try:
-            with open(csv_filename, 'r', encoding='utf-8') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    if row.get('id'):
-                        processed_market_ids.add(row['id'])
-            print(f"Found {len(processed_market_ids)} existing markets in {csv_filename}")
+            existing_df = pl.read_parquet(parquet_filename)
+            processed_market_ids.update(existing_df['id'].to_list())
+            print(f"Found {len(processed_market_ids)} existing markets in {parquet_filename}")
         except Exception as e:
             print(f"Error reading existing file: {e}")
-    
+
     for token_id in missing_token_ids:
         print(f"Fetching market for token: {token_id}")
         
@@ -122,62 +107,36 @@ def update_missing_tokens(missing_token_ids: List[str], csv_filename: str = "mis
                 market = markets[0]
                 market_id = market.get('id', '')
                 
-                # Skip if we already have this market
                 if market_id in processed_market_ids:
                     print(f"Market {market_id} already exists - skipping")
                     break
                 
-                # Parse clobTokenIds
                 clob_tokens_str = market.get('clobTokenIds', '[]')
-                if isinstance(clob_tokens_str, str):
-                    clob_tokens = json.loads(clob_tokens_str)
-                else:
-                    clob_tokens = clob_tokens_str
+                clob_tokens = json.loads(clob_tokens_str) if isinstance(clob_tokens_str, str) else clob_tokens_str
                 
                 if len(clob_tokens) < 2:
                     print(f"Invalid token data for {token_id}")
                     break
                 
-                token1, token2 = clob_tokens[0], clob_tokens[1]
-                
-                # Parse outcomes
                 outcomes_str = market.get('outcomes', '[]')
-                if isinstance(outcomes_str, str):
-                    outcomes = json.loads(outcomes_str)
-                else:
-                    outcomes = outcomes_str
+                outcomes = json.loads(outcomes_str) if isinstance(outcomes_str, str) else outcomes_str
                 
-                answer1 = outcomes[0] if len(outcomes) > 0 else 'YES'
-                answer2 = outcomes[1] if len(outcomes) > 1 else 'NO'
+                new_markets_data.append({
+                    'createdAt': market.get('createdAt', ''),
+                    'id': market_id,
+                    'question': market.get('question', '') or market.get('title', ''),
+                    'answer1': outcomes[0] if len(outcomes) > 0 else 'YES',
+                    'answer2': outcomes[1] if len(outcomes) > 1 else 'NO',
+                    'neg_risk': market.get('negRiskAugmented', False) or market.get('negRiskOther', False),
+                    'market_slug': market.get('slug', ''),
+                    'token1': clob_tokens[0],
+                    'token2': clob_tokens[1],
+                    'condition_id': market.get('conditionId', ''),
+                    'volume': market.get('volume', ''),
+                    'ticker': market['events'][0].get('ticker', '') if market.get('events') else '',
+                    'closedTime': market.get('closedTime', '')
+                })
                 
-                # Check for negative risk
-                neg_risk = market.get('negRiskAugmented', False) or market.get('negRiskOther', False)
-                
-                # Get ticker from events if available
-                ticker = ''
-                if market.get('events') and len(market.get('events', [])) > 0:
-                    ticker = market['events'][0].get('ticker', '')
-                
-                question_text = market.get('question', '') or market.get('title', '')
-                
-                # Create market row
-                row = [
-                    market.get('createdAt', ''),
-                    market_id,
-                    question_text,
-                    answer1,
-                    answer2,
-                    neg_risk,
-                    market.get('slug', ''),
-                    token1,
-                    token2,
-                    market.get('conditionId', ''),
-                    market.get('volume', ''),
-                    ticker,
-                    market.get('closedTime', '')
-                ]
-                
-                new_markets.append(row)
                 processed_market_ids.add(market_id)
                 print(f"Successfully fetched market {market_id} for token {token_id}")
                 break
@@ -190,24 +149,22 @@ def update_missing_tokens(missing_token_ids: List[str], csv_filename: str = "mis
         if retry_count >= max_retries:
             print(f"Failed to fetch token {token_id} after {max_retries} retries")
         
-        # Small delay between requests
         time.sleep(0.5)
     
-    if not new_markets:
+    if not new_markets_data:
         print("No new markets to add")
         return
     
-    # Write new markets to file
-    mode = 'a' if file_exists else 'w'
-    with open(csv_filename, mode, newline='', encoding='utf-8') as csvfile:
-        writer = csv.writer(csvfile)
-        
-        # Write headers only if new file
-        if not file_exists:
-            writer.writerow(headers)
-        
-        writer.writerows(new_markets)
+    new_markets_df = pl.DataFrame(new_markets_data)
     
-    print(f"Added {len(new_markets)} new markets to {csv_filename}")
-    print(f"Total markets now in file: {len(processed_market_ids)}")
+    if os.path.exists(parquet_filename):
+        existing_df = pl.read_parquet(parquet_filename)
+        combined_df = pl.concat([existing_df, new_markets_df]).unique(subset=['id'], keep='last')
+    else:
+        combined_df = new_markets_df
+        
+    combined_df.write_parquet(parquet_filename)
+    
+    print(f"Added {len(new_markets_data)} new markets to {parquet_filename}")
+    print(f"Total markets now in file: {len(combined_df)}")
 

@@ -3,25 +3,13 @@ warnings.filterwarnings('ignore')
 
 import sys
 import os
+import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import polars as pl
 from poly_utils.utils import get_markets, update_missing_tokens
 
-import subprocess
-
-
-def get_processed_df(df):
-    markets_df = get_markets()
-    markets_df = markets_df.rename({'id': 'market_id'})
-
-    # 1) Make markets long: (market_id, side, asset_id) where side ∈ {"token1", "token2"}
-    markets_long = (
-        markets_df
-        .select(["market_id", "token1", "token2"])
-        .melt(id_vars="market_id", value_vars=["token1", "token2"],
-            variable_name="side", value_name="asset_id")
-    )
+def get_processed_df(df, markets_long):
 
     # 2) Identify the non-USDC asset for each trade (the one that isn't 0)
     df = df.with_columns(
@@ -46,19 +34,12 @@ def get_processed_df(df):
         pl.col("market_id"),
     ])
 
-    df = df[['timestamp', 'market_id', 'maker', 'makerAsset', 'makerAmountFilled', 'taker', 'takerAsset', 'takerAmountFilled', 'transactionHash']]
+    df = df.select(['timestamp', 'market_id', 'maker', 'makerAsset', 'makerAmountFilled', 'taker', 'takerAsset', 'takerAmountFilled', 'transactionHash'])
 
     df = df.with_columns([
         (pl.col("makerAmountFilled") / 10**6).alias("makerAmountFilled"),
         (pl.col("takerAmountFilled") / 10**6).alias("takerAmountFilled"),
     ])
-
-    df = df.with_columns(
-        pl.when(pl.col("takerAsset") == "USDC")
-        .then(pl.lit("BUY"))
-        .otherwise(pl.lit("SELL"))
-        .alias("taker_direction")
-    )
 
     df = df.with_columns([
         pl.when(pl.col("takerAsset") == "USDC")
@@ -68,8 +49,8 @@ def get_processed_df(df):
 
         # reverse of taker_direction
         pl.when(pl.col("takerAsset") == "USDC")
-        .then(pl.lit("SELL")),
-        .otherwise(pl.lit("BUY")),
+        .then(pl.lit("SELL"))
+        .otherwise(pl.lit("BUY"))
         .alias("maker_direction"),
     ])
 
@@ -83,83 +64,134 @@ def get_processed_df(df):
         .then(pl.col("takerAmountFilled"))
         .otherwise(pl.col("makerAmountFilled"))
         .alias("usd_amount"),
+
         pl.when(pl.col("takerAsset") != "USDC")
         .then(pl.col("takerAmountFilled"))
-        .otherwise(pl.col("makerAmountFilled")),
+        .otherwise(pl.col("makerAmountFilled"))
         .alias("token_amount"),
+
         pl.when(pl.col("takerAsset") == "USDC")
-        .then(pl.col("takerAmountFilled") / pl.col("makerAmountFilled")),
-        .otherwise(pl.col("makerAmountFilled") / pl.col("takerAmountFilled")),
+        .then(pl.col("takerAmountFilled") / pl.col("makerAmountFilled"))
+        .otherwise(pl.col("makerAmountFilled") / pl.col("takerAmountFilled"))
         .cast(pl.Float64)
         .alias("price")
     ])
 
-
-    df = df[['timestamp', 'market_id', 'maker', 'taker', 'nonusdc_side', 'maker_direction', 'taker_direction', 'price', 'usd_amount', 'token_amount', 'transactionHash']]
+    df = df.select(['timestamp', 'market_id', 'maker', 'taker', 'nonusdc_side', 'maker_direction', 'taker_direction', 'price', 'usd_amount', 'token_amount', 'transactionHash'])
     return df
 
-
 def process_live():
-    processed_file = 'processed/trades.csv'
-
+    processed_dir = os.path.abspath('processed/trades')
     print("=" * 60)
     print("🔄 Processing Live Trades")
     print("=" * 60)
 
     last_processed_timestamp = 0
-
-    if os.path.exists(processed_file):
-        print(f"✓ Found existing processed file: {processed_file}")
+    if os.path.exists(processed_dir):
+        print(f"✓ Found existing processed directory: {processed_dir}")
         try:
-            last_processed_timestamp = pl.read_csv(processed_file).select(pl.max('timestamp')).item()
-            if last_processed_timestamp:
-                print(f"📍 Resuming from: {last_processed_timestamp}")
+            # Scan for the max timestamp in the *output* directory
+            latest_output_ts = pl.scan_parquet(f"{processed_dir}/**/*.parquet").select(pl.max('timestamp')).collect().item()
+            if latest_output_ts:
+                # Convert polars datetime to python datetime if necessary
+                if isinstance(latest_output_ts, datetime.datetime):
+                    last_processed_timestamp = latest_output_ts
+                else:
+                    # Assuming it's already a suitable datetime object or parsable string
+                    last_processed_timestamp = pl.from_epoch(latest_output_ts, time_unit='us')
+
+                print(f"📍 Resuming from after: {last_processed_timestamp}")
         except Exception as e:
-            print(f"Could not read last processed timestamp: {e}")
+            print(f"Could not read last processed timestamp, processing from beginning: {e}")
 
-    else:
-        print("⚠ No existing processed file found - processing from beginning")
-
+    import glob
     print(f"\n📂 Reading: goldsky/orderFilled")
+    all_files = sorted(glob.glob("goldsky/orderFilled/**/*.parquet", recursive=True))
 
-    schema_overrides = {
-        "takerAssetId": pl.Utf8,
-        "makerAssetId": pl.Utf8,
-    }
+    if not all_files:
+        print("No orderFilled parquet files found. Exiting.")
+        return
 
-    df = pl.scan_parquet("goldsky/orderFilled/**/*.parquet", schema_overrides=schema_overrides).collect(streaming=True)
-    df = df.with_columns(
-        pl.from_epoch(pl.col('timestamp'), time_unit='s').alias('timestamp')
+    FILE_CHUNK_SIZE = 10  # Process 10 files at a time to keep memory low
+    total_processed_rows = 0
+
+    print("\n🚀 Loading markets data once...")
+    markets_df = get_markets()
+    markets_df = markets_df.rename({'id': 'market_id'})
+    markets_long = (
+        markets_df
+        .select(["market_id", "token1", "token2"])
+        .melt(id_vars="market_id", value_vars=["token1", "token2"],
+            variable_name="side", value_name="asset_id")
     )
+    print("✅ Markets data loaded and prepared.")
 
-    print(f"✓ Loaded {len(df):,} rows")
+    for i in range(0, len(all_files), FILE_CHUNK_SIZE):
+        file_chunk = all_files[i:i + FILE_CHUNK_SIZE]
+        print(f"\n--- Processing file chunk {i//FILE_CHUNK_SIZE + 1} of {len(all_files)//FILE_CHUNK_SIZE + 1} ---")
 
-    if last_processed_timestamp:
-        df_process = df.filter(pl.col('timestamp') > last_processed_timestamp)
-    else:
-        df_process = df
+        lazy_frames = []
+        for file_path in file_chunk:
+            try:
+                lf = pl.scan_parquet(file_path).with_columns([
+                    pl.col("timestamp").cast(pl.Int64),
+                    pl.col("takerAssetId").cast(pl.Utf8),
+                    pl.col("makerAssetId").cast(pl.Utf8),
+                    pl.col("makerAmountFilled").cast(pl.Int64),
+                    pl.col("takerAmountFilled").cast(pl.Int64),
+                ])
+                lazy_frames.append(lf)
+            except Exception as e:
+                print(f"Could not process file {file_path}: {e}")
+                continue
 
-    print(f"⚙️  Processing {len(df_process):,} new rows...")
+        if not lazy_frames:
+            continue
 
-    if len(df_process) > 0:
-        new_df = get_processed_df(df_process)
+        chunk_df_lazy = pl.concat(lazy_frames)
+        
+        # Convert timestamp and filter
+        chunk_df_lazy = chunk_df_lazy.with_columns(
+            pl.from_epoch(pl.col('timestamp'), time_unit='s').alias('timestamp')
+        )
+        if last_processed_timestamp:
+            chunk_df_lazy = chunk_df_lazy.filter(pl.col('timestamp') > last_processed_timestamp)
 
-        if not os.path.isdir('processed'):
-            os.makedirs('processed')
+        # Collect only the small, filtered chunk
+        collected_chunk = chunk_df_lazy.collect()
+        if collected_chunk.is_empty():
+            print("No new rows in this chunk.")
+            continue
+            
+        print(f"📦 Processing batch of {len(collected_chunk):,} rows...")
+        
+        # Get the fully processed dataframe
+        new_df = get_processed_df(collected_chunk, markets_long)
+        if new_df.is_empty():
+            print("No processable trades in this chunk after joining with markets.")
+            continue
 
-        op_file = 'processed/trades.csv'
+        # Add year/month for partitioning
+        new_df = new_df.with_columns([
+            pl.col('timestamp').dt.year().alias('year'),
+            pl.col('timestamp').dt.month().alias('month'),
+        ])
+        
+        # Manually partition and write the chunk to avoid pyarrow issues
+        for (year, month), group in new_df.group_by(['year', 'month'], maintain_order=True):
+            partition_dir = os.path.join(processed_dir, f"year={year}", f"month={month}")
+            os.makedirs(partition_dir, exist_ok=True)
+            file_path = os.path.join(partition_dir, f"trades_chunk_{i//FILE_CHUNK_SIZE}.parquet")
+            group.write_parquet(file_path)
 
-        if not os.path.isfile(op_file):
-            new_df.write_csv(op_file)
-            print(f"✓ Created new file: processed/trades.csv")
-        else:
-            print(f"✓ Appending {len(new_df):,} rows to processed/trades.csv")
-            with open(op_file, mode="a") as f:
-                new_df.write_csv(f, include_header=False)
+        print(f"✓ Appended {len(new_df):,} rows")
+        total_processed_rows += len(new_df)
 
+    print(f"\n✅ Total processed: {total_processed_rows:,} new rows")
     print("=" * 60)
     print("✅ Processing complete!")
     print("=" * 60)
 
 if __name__ == "__main__":
     process_live()
+

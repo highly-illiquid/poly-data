@@ -1,21 +1,17 @@
 # Active Context
 
-**Current Focus:** Resolving VPS disk space issue to enable successful data extraction and pipeline setup.
+**Current Focus:** Finalizing the end-to-end, memory-safe, partitioned parquet data pipeline.
 
 **Recent Changes:**
-- The `setup_vps.sh` script has been significantly enhanced to include:
-    - Installation of `unzip`.
-    - Installation and configuration of `Oh My Posh`.
-    - Installation and configuration of `eza` (modern `ls` replacement).
-    - Installation and configuration of `ble.sh` (Bash Line Editor).
-- Identified critical blocker: VPS disk is full, preventing complete data extraction.
-- Decision made to delete incomplete `poly-data` directory and `archive.tar.xz` file, then free up sufficient disk space before retrying data extraction.
+- **`update_markets.py`:** Re-architected to fetch newest markets first, avoiding an inefficient loop through all historical data. Made resilient to inconsistent API schemas (missing columns, wrong data types).
+- **`migrate_orderfilled.py`:** Created a low-memory, one-time migration script using a row-group-by-row-group PyArrow approach to convert a large legacy Parquet file into the new partitioned format.
+- **`process_live.py`:** Completely re-architected to be memory-safe on a resource-constrained VPS. It now processes files in small chunks instead of attempting to `concat` a large list of lazy frames, which was causing memory spikes. The script is now robust against the schema inconsistencies discovered in the raw data.
+- **Data Structure:** Corrected a major structural issue where raw data was being incorrectly saved into the `processed/` directory. The project now follows a clean datalake structure (`raw/`, `processed/`).
 
-**Next Steps:** User needs to free up disk space on the VPS. Once space is available, the user will re-clone the repository and re-attempt the data snapshot extraction.
+**Next Steps:**
+- Run the final, re-architected `process_live.py` script to generate the clean `processed/trades` dataset.
+- Once the pipeline is confirmed to run successfully end-to-end, the project can move to the analysis phase.
 
 **Important Patterns and Preferences:**
-- Use `uv` for Python package management.
-- Use `git` for code deployment to VPS.
-- Use `rsync` for data synchronization from VPS to local.
-- Utilize `tmux` on the VPS for running long-duration processes in the background.
-- Enhanced shell experience with `Oh My Posh`, `eza`, and `ble.sh`.
+- **Memory First:** All data processing must be designed with low memory usage as a primary constraint. Prefer streaming, chunking, or lazy operations where possible, but be aware that some lazy operations like `pl.concat` can still have high memory overhead.
+- **Defensive Coding:** Assume all external data sources are unstable. Code must be resilient to schema changes, missing columns, and incorrect data types.
